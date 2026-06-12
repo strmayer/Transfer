@@ -292,6 +292,7 @@ $spConfigRows   = Get-SnapBlock $snap '3_11_SP_Configure'
 $tempdbRows     = Get-SnapBlock $snap '3_12_TempDB'   # contains ALL db files — must filter below
 $dbFilesAll     = Get-SnapBlock $snap 'DB_Files_All'
 $vaultSysRows   = Get-SnapBlock $snap 'VaultSys_SA_Status'
+$serviceRows    = Get-SnapBlock $snap 'SQL_Services'
 
 $collation    = if ($collationRows.Count -gt 0) { $collationRows[0].Server_Collation } else { 'SQL_Latin1_General_CP1_CI_AS' }
 $winAuthOnly  = if ($authRows.Count -gt 0)      { [int]$authRows[0].WindowsAuthOnly_Value } else { 0 }
@@ -313,6 +314,12 @@ $tcpPortSource = if ($tcpPortSource) { [int]$tcpPortSource } else { 1433 }
 # SA status on source (Disabled = false means active)
 $saRow     = $vaultSysRows | Where-Object { $_.Login -eq 'sa' } | Select-Object -First 1
 $saEnabled = ($null -ne $saRow -and $saRow.Disabled -eq $false)
+
+# SQL Services — derive Agent startup type and warn about domain service accounts
+$sqlEngineSvc  = $serviceRows | Where-Object { $_.Service -notlike '*Agent*' -and $_.Service -notlike '*FDLauncher*' } | Select-Object -First 1
+$sqlAgentSvc   = $serviceRows | Where-Object { $_.Service -like '*Agent*' } | Select-Object -First 1
+$agentStartup  = if ($sqlAgentSvc -and $sqlAgentSvc.Startup_Type) { $sqlAgentSvc.Startup_Type } else { 'Automatic' }
+$srcEngineAcct = if ($sqlEngineSvc) { $sqlEngineSvc.Service_Account } else { '' }
 
 # ── Derive disk layout from snapshot ──────────────────────────────────────────
 # User (Vault) databases live in a dedicated directory separate from system DBs.
@@ -343,9 +350,15 @@ Write-Log "FTS installed    : $($ftsInstalled -eq 1)"
 Write-Log "TCP port         : $tcpPortSource"
 Write-Log "tempdb data files: $tempdbFileCount x ${tempdbFileSize} MB (log: ${tempdbLogSize} MB)"
 Write-Log "SA active on src : $saEnabled"
+Write-Log "Agent startup    : $agentStartup (from snapshot)"
+Write-Log "Source svc acct  : $srcEngineAcct"
 Write-Log "DataDir (derived): $DataDir"
 Write-Log "LogDir  (derived): $LogDir"
 Write-Log "BackupDir derived: $BackupDir"
+
+if ($srcEngineAcct -and $srcEngineAcct -notmatch '^NT (AUTHORITY|SERVICE|Service)\\') {
+    Write-Log "Source SQL Engine runs under domain account '$srcEngineAcct'. If the target requires the same account, set -SqlSvcAccount and -SqlSvcPassword explicitly." 'WARN'
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -407,7 +420,7 @@ try {
         "/SQLTEMPDBLOGFILESIZE=$tempdbLogSize"
         "/SQLSVCACCOUNT=$SqlSvcAccount"
         "/AGTSVCACCOUNT=$AgentSvcAccount"
-        '/AGTSVCSTARTUPTYPE=Automatic'
+        "/AGTSVCSTARTUPTYPE=$agentStartup"
         '/SQLSVCSTARTUPTYPE=Automatic'
         '/BROWSERSVCSTARTUPTYPE=Disabled'
         '/IACCEPTSQLSERVERLICENSETERMS'   # SQL Server 2022 / 2025
