@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Automated collection of all SQL Server parameters from the source environment for Vault migration 2024 → 2026.
