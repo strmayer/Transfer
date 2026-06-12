@@ -45,7 +45,7 @@ no shared storage required — copy the file by any means (USB, fileshare, SFTP)
 |---|---|
 | PowerShell | 5.1+ |
 | OS | Windows Server 2022 (same or higher than source) |
-| Disk layout | Pre-provisioned — directories passed as parameters (`-DataDir`, `-LogDir`, etc.) |
+| Disk layout | Target drives must exist (e.g. `D:\`). Directories are **auto-created** from the snapshot — no manual pre-configuration needed unless you want to override the derived paths. |
 | SQL Server media | `setup.exe` accessible on the target (local path or mounted ISO) |
 | Permissions | **Local Administrator** (`#Requires -RunAsAdministrator`) |
 | SQL instance | **No existing instance** with the same name — the script exits 1 if found |
@@ -86,30 +86,49 @@ transfer over any channel.
 ### Step 3 — Install on the target server
 
 ```powershell
-# Minimum invocation (default disk layout C:\SQL*)
-$pw = Read-Host -AsSecureString 'SA Password'
-.\Install-SqlFromSnapshot.ps1 `
-    -SetupExe  'D:\SQLSetup\setup.exe' `
-    -SnapshotJson 'C:\Temp\sql_params.json' `
-    -SaPassword $pw
-
-# Custom disk layout (recommended for production)
+# Standard invocation — disk layout is derived automatically from the snapshot
 $pw = Read-Host -AsSecureString 'SA Password'
 .\Install-SqlFromSnapshot.ps1 `
     -SetupExe     'D:\SQLSetup\setup.exe' `
     -SnapshotJson 'C:\Temp\sql_params.json' `
+    -SaPassword   $pw
+```
+
+The script starts with an **interactive prompt** for hostname/year string replacement:
+
+```
+  String to replace in snapshot values (e.g. 2023) — ENTER to skip: 2023
+  Replace '2023' with: 2025
+```
+
+This renames any snapshot-derived string containing the old value — e.g.
+`AZVDB2023` → `AZVDB2025`, `ADMS-AZVDB2023` → `ADMS-AZVDB2025`.
+Press ENTER twice to skip replacement.
+
+The script then derives and logs the disk paths it will use:
+
+```
+  DataDir (derived): D:\Vault\DB
+  LogDir  (derived): D:\Vault\DB
+  BackupDir derived: D:\Vault\Backup
+```
+
+To override any path explicitly:
+
+```powershell
+.\Install-SqlFromSnapshot.ps1 `
+    -SetupExe     'D:\SQLSetup\setup.exe' `
+    -SnapshotJson 'C:\Temp\sql_params.json' `
     -SaPassword   $pw `
-    -DataDir      'E:\SQLData' `
-    -LogDir       'F:\SQLLogs' `
-    -TempDir      'F:\SQLTemp' `
-    -BackupDir    'G:\SQLBackup'
+    -DataDir      'E:\Vault\DB' `
+    -BackupDir    'F:\Vault\Backup'
 ```
 
 **Dry run first:**
 ```powershell
 .\Install-SqlFromSnapshot.ps1 ... -WhatIf
 ```
-WhatIf prints the resolved parameters (features, collation, tempdb layout)
+WhatIf prints all resolved parameters — features, collation, derived paths, tempdb layout —
 without touching the disk or registry.
 
 ### Step 4 — Restore user databases
@@ -150,9 +169,20 @@ Restore-SqlDatabase `
 | `/SAPWD` | `-SaPassword` parameter | — |
 | `/TCPENABLED=1` | always enabled | — |
 | `/FEATURES` includes `FULLTEXT` | `3_9a_FTS_Installed.FTS_Installed == 1` | omitted |
-| `/SQLTEMPDBFILECOUNT` | count of ROWS entries in `3_12_TempDB` | 1 |
+| `/SQLUSERDBDIR` | directory of first ROWS file in `DB_Files_All` (non-system DB) | `D:\Vault\DB` |
+| `/SQLUSERDBLOGDIR` | directory of first LOG file in `DB_Files_All` (non-system DB) | same as DataDir |
+| `/SQLBACKUPDIR` | derived from DataDir (`\DB` → `\Backup`) | `D:\Vault\Backup` |
+| `/SQLTEMPDBFILECOUNT` | ROWS count in `DB_Files_All` where `Database = tempdb` | 1 |
 | `/SQLTEMPDBFILESIZE` | `SizeMB` of first tempdb data file | 8 MB |
 | `/SQLTEMPDBLOGFILESIZE` | `SizeMB` of tempdb log file | 8 MB |
+| `/SQLTEMPDBDIR` | **only passed if `-TempDir` is explicitly set** — otherwise setup uses the instance DATA folder (matches source behaviour) | not passed |
+
+> **tempdb detection note:** The `3_12_TempDB` snapshot block is produced by an
+> unfiltered `sys.master_files` query and therefore contains files from **all**
+> databases (Vault DBs, master, model, msdb, tempdb). The install script
+> cross-references with `DB_Files_All` (which has a `Database` column) to isolate
+> only the true tempdb files (`tempdev`, `temp2`, `templog`) before computing
+> the file count and sizes passed to setup.exe.
 
 ### Phase 2 — Post-install T-SQL configuration
 
@@ -196,24 +226,42 @@ The instance is functional — mismatches require manual correction.
 ```json
 {
   "Meta": {
-    "CollectedAt": "12.06.2026 09:14:22",
-    "CollectedOn": "SOURCESERVER01",
-    "SqlInstance": ".",
-    "AuthMode": "Windows Authentication",
-    "ScriptVersion": "1.1 / JM Consulting"
+    "CollectedAt":  "12.06.2026 13:27:20",
+    "CollectedOn":  "AZVDB2023",
+    "SqlInstance":  "AZVDB2023\\AUTODESKVAULT",
+    "AuthMode":     "SQL Authentication (sa)",
+    "ScriptVersion":"1.1 / JM Consulting"
   },
   "Blocks": {
-    "3_5_Server_Collation":   [{ "Server_Collation": "SQL_Latin1_General_CP1_CI_AS" }],
-    "3_7_Auth_Mode":          [{ "WindowsAuthOnly_Value": 0, "Authentication_Mode": "Mixed Mode ..." }],
-    "3_8_TCP_Listener":       [{ "TCP_Port": 1433, "Listening": true, ... }],
-    "3_9a_FTS_Installed":     [{ "FTS_Installed": 0 }],
-    "3_11_SP_Configure":      [{ "Parameter": "max server memory (MB)", "Configured": 8192, ... }],
-    "3_12_TempDB":            [{ "File_Name": "tempdev", "Type": "ROWS", "SizeMB": 512, ... }],
-    "VaultSys_SA_Status":     [{ "Login": "sa", "Disabled": 0, ... }],
+    "3_5_Server_Collation":  [{ "Server_Collation": "SQL_Latin1_General_CP1_CI_AS" }],
+    "3_7_Auth_Mode":         [{ "WindowsAuthOnly_Value": 0, "Authentication_Mode": "Mixed Mode ..." }],
+    "3_8_TCP_Listener":      null,
+    "3_9a_FTS_Installed":    [{ "FTS_Installed": 1 }],
+    "3_11_SP_Configure":     [{ "Parameter": "max server memory (MB)", "Configured": 2147483647, ... }],
+    "3_12_TempDB":           [
+      { "File_Name": "Aquaflex",   "Type": "ROWS", "Path": "D:\\Vault\\DB\\Aquaflex.mdf",  ... },
+      { "File_Name": "tempdev",    "Type": "ROWS", "Path": "C:\\...\\DATA\\tempdb.mdf",    ... },
+      { "File_Name": "temp2",      "Type": "ROWS", "Path": "C:\\...\\DATA\\tempdb_mssql_2.ndf", ... },
+      { "File_Name": "templog",    "Type": "LOG",  "Path": "C:\\...\\DATA\\templog.ldf",   ... }
+    ],
+    "DB_Files_All":          [
+      { "Database": "Aquaflex",  "Type": "ROWS", "Logical_Name": "Aquaflex",  "Physical_Path": "D:\\Vault\\DB\\Aquaflex.mdf",  "SizeMB": 35457 },
+      { "Database": "tempdb",    "Type": "ROWS", "Logical_Name": "tempdev",   "Physical_Path": "C:\\...\\DATA\\tempdb.mdf",    "SizeMB": 8 },
+      { "Database": "tempdb",    "Type": "ROWS", "Logical_Name": "temp2",     "Physical_Path": "C:\\...\\DATA\\tempdb_mssql_2.ndf", "SizeMB": 8 },
+      { "Database": "tempdb",    "Type": "LOG",  "Logical_Name": "templog",   "Physical_Path": "C:\\...\\DATA\\templog.ldf",   "SizeMB": 8 }
+    ],
+    "VaultSys_SA_Status":    [{ "Login": "sa", "Disabled": false, ... }],
     ...
   }
 }
 ```
+
+**Key block notes:**
+
+| Block | Used for | Caution |
+|---|---|---|
+| `3_12_TempDB` | tempdb autogrowth settings (has `Autogrowth_Raw`, `Autogrowth_Percent` fields) | Contains **all** database files — `sys.master_files` is unfiltered. Do not use for tempdb file count. |
+| `DB_Files_All` | disk path derivation + tempdb file count/size | Has `Database` column — filter on `Database = 'tempdb'` for tempdb files, exclude system DBs for user data paths. |
 
 All block keys use underscores (`_`) — PowerShell's `ConvertFrom-Json` replaces
 dots and spaces with underscores when creating property names.
@@ -259,5 +307,5 @@ SQL Server setup log: `%ProgramFiles%\Microsoft SQL Server\<ver>\Setup Bootstrap
 
 ---
 
-*Document version: 1.0 — 2026-06-12*
+*Document version: 1.1 — 2026-06-12*
 *Author: (c) JM and Claude Code*
