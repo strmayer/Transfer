@@ -1,7 +1,12 @@
 # SQL Server Migration — Technical Procedure
 
-Automated migration of a SQL Server instance using parameter snapshot and
-unattended installation. Developed for the Vault Migration 2024 → 2026 project.
+Automated creation of a SQL Server instance with identical parameters to the
+source environment. Developed for the Vault Migration 2024 → 2026 project.
+
+**Scope:** This procedure covers SQL Server installation and configuration only.
+Database backup and restore is performed separately by the **Autodesk Vault
+migration helper** — that tool expects a correctly configured SQL instance to
+already exist before it runs.
 
 **Toolchain:** `Get-SqlParameters.ps1` (source) → `Install-SqlFromSnapshot.ps1` (target)
 
@@ -22,6 +27,10 @@ Get-SqlParameters.ps1                  Install-SqlFromSnapshot.ps1
                                          │
                                          └─ Phase 3: verification
                                               compare → exit 0 / exit 2
+
+                                         ↓
+                                         Autodesk Vault migration helper
+                                         (backup / restore — out of scope here)
 ```
 
 The JSON file is the single transfer artifact. No agent, no remote session,
@@ -131,30 +140,28 @@ To override any path explicitly:
 WhatIf prints all resolved parameters — features, collation, derived paths, tempdb layout —
 without touching the disk or registry.
 
-### Step 4 — Restore user databases
+### Step 4 — Hand off to Autodesk Vault migration helper
 
-After the script exits 0, restore databases from backup:
+Once the script exits with code `0`, the SQL Server instance is ready.
+Database backup and restore is handled entirely by the **Autodesk Vault
+migration helper** — run it according to the Autodesk migration guide.
 
-```powershell
-# Example — adjust paths and database names
-Restore-SqlDatabase `
-    -ServerInstance '.' `
-    -Database 'VaultDB' `
-    -BackupFile 'G:\SQLBackup\VaultDB_Full.bak' `
-    -RelocateFile @(
-        New-Object Microsoft.SqlServer.Management.Smo.RelocateFile('VaultDB',      'E:\SQLData\VaultDB.mdf'),
-        New-Object Microsoft.SqlServer.Management.Smo.RelocateFile('VaultDB_log',  'F:\SQLLogs\VaultDB_log.ldf')
-    )
-```
+**Pre-conditions the Autodesk tool expects (verified by our script):**
 
-### Step 5 — Post-restore checklist
+- [ ] SQL Server instance running with correct collation (`SQL_Latin1_General_CP1_CI_AS`)
+- [ ] Mixed Mode authentication enabled, SA account active
+- [ ] `VaultSys` login present — set password before starting the Autodesk tool (not captured in snapshot)
+- [ ] TCP port reachable from application servers (check firewall if non-1433)
+- [ ] Data directory exists and is writable (`D:\Vault\DB\` or as derived from snapshot)
 
-- [ ] Verify `VaultSys` login exists and is enabled (`sql_params.txt` → VaultSys section)
-- [ ] Set `VaultSys` password (not captured in snapshot — coordinate with Vault team)
-- [ ] Check database compatibility levels match source (see `sql_params.txt` block 3.6)
-- [ ] Verify SQL Agent jobs if applicable (re-create manually — jobs are not migrated by this script)
-- [ ] Confirm TCP port is reachable from application servers (firewall rule)
-- [ ] Run a full backup to initialize backup chain on target
+### Step 5 — Post-migration checklist
+
+After the Autodesk migration helper completes:
+
+- [ ] Verify `Aquaflex` and `KnowledgeVaultMaster` databases are online
+- [ ] Check database compatibility levels match source (see `sql_params.txt` block 3.6 — source: level 110)
+- [ ] Verify SQL Agent jobs if applicable (re-create manually — not migrated by either script)
+- [ ] Run a full backup to initialize backup chain on the new instance
 
 ---
 
@@ -287,7 +294,7 @@ SQL Server setup log: `%ProgramFiles%\Microsoft SQL Server\<ver>\Setup Bootstrap
 | Item | Detail |
 |---|---|
 | SQL Agent jobs | Captured in snapshot (block `3_13_SQL_Agent_Jobs`) for reference only — not re-created automatically |
-| User databases | Not migrated — restore from backup separately (Step 4) |
+| User databases | Backup/restore handled by Autodesk Vault migration helper (out of scope) |
 | Additional logins | Snapshot lists all logins; only SA is configured — recreate others manually |
 | Named instances | Supported via `-InstanceName`; service names and registry paths resolve automatically |
 | SQL Server edition | setup.exe determines edition (Developer, Standard, Enterprise); the script does not select edition |
@@ -307,5 +314,5 @@ SQL Server setup log: `%ProgramFiles%\Microsoft SQL Server\<ver>\Setup Bootstrap
 
 ---
 
-*Document version: 1.1 — 2026-06-12*
+*Document version: 1.2 — 2026-06-12*
 *Author: (c) JM and Claude Code*
