@@ -80,6 +80,8 @@ $ErrorActionPreference = 'Stop'
 
 .NOTES
     V1.0/Created - 2026-06-12 - Initial version
+    V1.1/Modified - 2026-06-12 - Derive disk layout from snapshot; fix tempdb file detection;
+                                  interactive string replacement (e.g. hostname year 2023 → 2025)
 
     Author: (c) JM and Claude Code
 
@@ -118,10 +120,10 @@ param(
     [SecureString]$SqlSvcPassword,
     [string]$AgentSvcAccount  = 'NT AUTHORITY\SYSTEM',
 
-    [string]$DataDir          = 'C:\SQLData',
-    [string]$LogDir           = 'C:\SQLLogs',
-    [string]$TempDir          = 'C:\SQLTemp',
-    [string]$BackupDir        = 'C:\SQLBackup',
+    [string]$DataDir          = '',   # derived from snapshot if not set
+    [string]$LogDir           = '',   # derived from snapshot if not set
+    [string]$TempDir          = '',   # leave empty → setup uses default instance DATA path
+    [string]$BackupDir        = '',   # derived from DataDir if not set
 
     [string]$SysAdminAccounts = 'BUILTIN\Administrators',
 
@@ -248,10 +250,30 @@ function Open-SqlConnectionWinAuth {
 # REGION: Load and validate snapshot
 # ─────────────────────────────────────────────────────────────────────────────
 
-Write-Log "=== Install-SqlFromSnapshot v1.0 starting ==="
+Write-Log "=== Install-SqlFromSnapshot v1.1 starting ==="
 Write-Log "Snapshot : $SnapshotJson"
 Write-Log "Setup    : $SetupExe"
 Write-Log "Instance : $InstanceName"
+
+# ── Interactive string replacement ────────────────────────────────────────────
+# Typical use: source server was AZVDB2023, target is AZVDB2025 → replace '2023' with '2025'.
+# Applied to any string value derived from the snapshot (login names, paths, log output).
+Write-Host ''
+$srcString = Read-Host '  String to replace in snapshot values (e.g. 2023) — ENTER to skip'
+$dstString = ''
+if ($srcString) {
+    $dstString = Read-Host "  Replace '$srcString' with"
+    Write-Log "String replacement active: '$srcString' -> '$dstString'"
+} else {
+    Write-Log 'String replacement: skipped.'
+}
+Write-Host ''
+
+function Invoke-StrReplace {
+    param([string]$Value)
+    if ($srcString -and $Value) { return $Value.Replace($srcString, $dstString) }
+    return $Value
+}
 
 try {
     $snap = Get-Content $SnapshotJson -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -267,7 +289,8 @@ $authRows       = Get-SnapBlock $snap '3_7_Auth_Mode'
 $tcpRows        = Get-SnapBlock $snap '3_8_TCP_Listener'
 $ftsRows        = Get-SnapBlock $snap '3_9a_FTS_Installed'
 $spConfigRows   = Get-SnapBlock $snap '3_11_SP_Configure'
-$tempdbRows     = Get-SnapBlock $snap '3_12_TempDB'
+$tempdbRows     = Get-SnapBlock $snap '3_12_TempDB'   # contains ALL db files — must filter below
+$dbFilesAll     = Get-SnapBlock $snap 'DB_Files_All'
 $vaultSysRows   = Get-SnapBlock $snap 'VaultSys_SA_Status'
 
 $collation    = if ($collationRows.Count -gt 0) { $collationRows[0].Server_Collation } else { 'SQL_Latin1_General_CP1_CI_AS' }
@@ -275,25 +298,54 @@ $winAuthOnly  = if ($authRows.Count -gt 0)      { [int]$authRows[0].WindowsAuthO
 $ftsInstalled = if ($ftsRows.Count -gt 0)       { [int]$ftsRows[0].FTS_Installed } else { 0 }
 $mixedMode    = ($winAuthOnly -eq 0)
 
-$tempdbDataFiles = @($tempdbRows | Where-Object { $_.Type -eq 'ROWS' })
-$tempdbLogFile   = $tempdbRows | Where-Object { $_.Type -eq 'LOG' } | Select-Object -First 1
-$tempdbFileCount = [Math]::Max(1, $tempdbDataFiles.Count)
-$tempdbFileSize  = if ($tempdbDataFiles.Count -gt 0) { [Math]::Max(8, [int]$tempdbDataFiles[0].SizeMB) } else { 8 }
-$tempdbLogSize   = if ($null -ne $tempdbLogFile)     { [Math]::Max(8, [int]$tempdbLogFile.SizeMB)      } else { 8 }
+# tempdb: 3_12_TempDB contains ALL database files (sys.master_files has no DB filter in the query).
+# Cross-reference with DB_Files_All to get the correct tempdb logical names, then filter.
+$tempdbLogicalNames = @(($dbFilesAll | Where-Object { $_.Database -eq 'tempdb' }).Logical_Name)
+$tempdbDataFiles    = @($tempdbRows | Where-Object { $_.File_Name -in $tempdbLogicalNames -and $_.Type -eq 'ROWS' })
+$tempdbLogFile      = $tempdbRows   | Where-Object { $_.File_Name -in $tempdbLogicalNames -and $_.Type -eq 'LOG'  } | Select-Object -First 1
+$tempdbFileCount    = [Math]::Max(1, $tempdbDataFiles.Count)
+$tempdbFileSize     = if ($tempdbDataFiles.Count -gt 0) { [Math]::Max(8, [int]$tempdbDataFiles[0].SizeMB) } else { 8 }
+$tempdbLogSize      = if ($null -ne $tempdbLogFile)     { [Math]::Max(8, [int]$tempdbLogFile.SizeMB)      } else { 8 }
 
 $tcpPortSource = ($tcpRows | Where-Object { [int]$_.TCP_Port -gt 0 } | Select-Object -First 1).TCP_Port
 $tcpPortSource = if ($tcpPortSource) { [int]$tcpPortSource } else { 1433 }
 
-# SA status on source (is_disabled = 0 means active)
-$saRow      = $vaultSysRows | Where-Object { $_.Login -eq 'sa' } | Select-Object -First 1
-$saEnabled  = ($null -ne $saRow -and [int]$saRow.Disabled -eq 0)
+# SA status on source (Disabled = false means active)
+$saRow     = $vaultSysRows | Where-Object { $_.Login -eq 'sa' } | Select-Object -First 1
+$saEnabled = ($null -ne $saRow -and $saRow.Disabled -eq $false)
 
+# ── Derive disk layout from snapshot ──────────────────────────────────────────
+# User (Vault) databases live in a dedicated directory separate from system DBs.
+# Read the actual path from DB_Files_All and use it as the install target.
+$systemDbs      = @('master', 'model', 'msdb', 'tempdb')
+$userDataFiles  = @($dbFilesAll | Where-Object { $_.Database -notin $systemDbs -and $_.Type -eq 'ROWS' })
+$userLogFiles   = @($dbFilesAll | Where-Object { $_.Database -notin $systemDbs -and $_.Type -eq 'LOG'  })
+
+$derivedDataDir = if ($userDataFiles.Count -gt 0) {
+    [System.IO.Path]::GetDirectoryName($userDataFiles[0].Physical_Path)
+} else { 'D:\Vault\DB' }
+$derivedLogDir  = if ($userLogFiles.Count -gt 0) {
+    [System.IO.Path]::GetDirectoryName($userLogFiles[0].Physical_Path)
+} else { $derivedDataDir }
+# Backup directory: replace the last path segment (\DB) with \Backup
+$derivedBackupDir = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($derivedDataDir), 'Backup')
+
+# Parameters override derived values; empty string means "use derived"
+if (-not $DataDir)   { $DataDir   = Invoke-StrReplace $derivedDataDir }
+if (-not $LogDir)    { $LogDir    = Invoke-StrReplace $derivedLogDir }
+if (-not $BackupDir) { $BackupDir = Invoke-StrReplace $derivedBackupDir }
+# TempDir intentionally left empty → setup.exe places tempdb in the instance DATA folder
+
+Write-Log "Source server    : $(Invoke-StrReplace $snap.Meta.CollectedOn) (was: $($snap.Meta.CollectedOn))"
 Write-Log "Source collation : $collation"
 Write-Log "Mixed Mode       : $mixedMode"
 Write-Log "FTS installed    : $($ftsInstalled -eq 1)"
 Write-Log "TCP port         : $tcpPortSource"
-Write-Log "tempdb data files: $tempdbFileCount x ${tempdbFileSize} MB"
+Write-Log "tempdb data files: $tempdbFileCount x ${tempdbFileSize} MB (log: ${tempdbLogSize} MB)"
 Write-Log "SA active on src : $saEnabled"
+Write-Log "DataDir (derived): $DataDir"
+Write-Log "LogDir  (derived): $LogDir"
+Write-Log "BackupDir derived: $BackupDir"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,7 +400,6 @@ try {
         '/TCPENABLED=1'
         "/SQLUSERDBDIR=$DataDir"
         "/SQLUSERDBLOGDIR=$LogDir"
-        "/SQLTEMPDBDIR=$TempDir"
         "/SQLBACKUPDIR=$BackupDir"
         "/SQLSYSADMINACCOUNTS=$SysAdminAccounts"
         "/SQLTEMPDBFILECOUNT=$tempdbFileCount"
@@ -361,6 +412,8 @@ try {
         '/BROWSERSVCSTARTUPTYPE=Disabled'
         '/IACCEPTSQLSERVERLICENSETERMS'   # SQL Server 2022 / 2025
     )
+    # Only set tempdb directory if explicitly overridden; otherwise setup uses the instance DATA folder
+    if ($TempDir) { $setupArgs.Add("/SQLTEMPDBDIR=$TempDir") }
 
     if ($mixedMode) {
         $setupArgs.Add('/SECURITYMODE=SQL')
