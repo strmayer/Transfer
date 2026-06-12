@@ -183,6 +183,7 @@ After the Autodesk migration helper completes:
 | `/SQLTEMPDBFILESIZE` | `SizeMB` of first tempdb data file | 8 MB |
 | `/SQLTEMPDBLOGFILESIZE` | `SizeMB` of tempdb log file | 8 MB |
 | `/SQLTEMPDBDIR` | **only passed if `-TempDir` is explicitly set** — otherwise setup uses the instance DATA folder (matches source behaviour) | not passed |
+| `/AGTSVCSTARTUPTYPE` | `SQL_Services` — entry matching `*Agent*` → `Startup_Type` | `Automatic` |
 
 > **tempdb detection note:** The `3_12_TempDB` snapshot block is produced by an
 > unfiltered `sys.master_files` query and therefore contains files from **all**
@@ -190,6 +191,12 @@ After the Autodesk migration helper completes:
 > cross-references with `DB_Files_All` (which has a `Database` column) to isolate
 > only the true tempdb files (`tempdev`, `temp2`, `templog`) before computing
 > the file count and sizes passed to setup.exe.
+
+**Service account note:** The script reads the SQL Engine service account from
+`SQL_Services` and logs it. If the source runs under a **domain account**
+(e.g. `appl_admin@aquaflex.de`) rather than a built-in NT account, the script
+emits a WARN and the operator must supply `-SqlSvcAccount` and `-SqlSvcPassword`
+explicitly. Without this, setup uses `NT AUTHORITY\SYSTEM`.
 
 ### Phase 2 — Post-install T-SQL configuration
 
@@ -257,6 +264,10 @@ The instance is functional — mismatches require manual correction.
       { "Database": "tempdb",    "Type": "ROWS", "Logical_Name": "temp2",     "Physical_Path": "C:\\...\\DATA\\tempdb_mssql_2.ndf", "SizeMB": 8 },
       { "Database": "tempdb",    "Type": "LOG",  "Logical_Name": "templog",   "Physical_Path": "C:\\...\\DATA\\templog.ldf",   "SizeMB": 8 }
     ],
+    "SQL_Services":          [
+      { "Service": "SQL Server (AUTODESKVAULT)",       "Service_Account": "appl_admin@aquaflex.de", "Startup_Type": "Automatic", "Status": "Running" },
+      { "Service": "SQL Server-Agent (AUTODESKVAULT)", "Service_Account": "appl_admin@aquaflex.de", "Startup_Type": "Automatic", "Status": "Running" }
+    ],
     "VaultSys_SA_Status":    [{ "Login": "sa", "Disabled": false, ... }],
     ...
   }
@@ -289,6 +300,29 @@ SQL Server setup log: `%ProgramFiles%\Microsoft SQL Server\<ver>\Setup Bootstrap
 
 ---
 
+## Observed Differences Between Source Systems
+
+Two source snapshots have been collected and tested (AZVDB2023, AZVDB2024).
+Key differences relevant to the install script:
+
+| Parameter | AZVDB2023 | AZVDB2024 | Handled by script |
+|---|---|---|---|
+| Server collation | `SQL_Latin1_General_CP1_CI_AS` | `Latin1_General_CI_AS` | Yes — read from snapshot |
+| SQL Agent startup | `Manual` / Stopped | `Automatic` / Running | Yes — read from `SQL_Services` |
+| Service account | `appl_admin@aquaflex.de` | `appl_admin@aquaflex.de` | Warning logged — set `-SqlSvcAccount` manually |
+| `BUILTIN\Administrators` sysadmin | not present | present | No — recreate manually if needed |
+| Aquaflex data size | ~35 GB | ~41 GB | No impact on install |
+| KnowledgeVaultMaster log | 4 MB | 2.1 GB | No impact on install |
+| Backup path | `E:\Backups\` | `F:\VaultBackups\2023\` | Out of scope (Autodesk helper) |
+| sp_configure values | identical | identical | — |
+
+**Collation note:** The collation difference (`SQL_Latin1_General_CP1_CI_AS` vs.
+`Latin1_General_CI_AS`) is significant — it affects sort order and string comparison
+behaviour in SQL. The install script applies whichever value the snapshot contains.
+Verify that the Vault application is compatible with the target collation before go-live.
+
+---
+
 ## Known Limitations
 
 | Item | Detail |
@@ -314,5 +348,5 @@ SQL Server setup log: `%ProgramFiles%\Microsoft SQL Server\<ver>\Setup Bootstrap
 
 ---
 
-*Document version: 1.2 — 2026-06-12*
+*Document version: 1.3 — 2026-06-12*
 *Author: (c) JM and Claude Code*
